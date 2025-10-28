@@ -64,7 +64,7 @@ KipuBankV3
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/JPKP-Kuhn/KipuBankV3.git
    cd KipuBankV3
    ```
 
