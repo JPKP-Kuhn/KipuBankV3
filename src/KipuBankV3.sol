@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.30;
+pragma solidity ^0.8.26;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@universal-router/interfaces/IUniversalRouter.sol";
+import "@permit2/interfaces/IPermit2.sol";
+import "@v4-core/types/PoolKey.sol";
+import "@v4-core/types/Currency.sol";
 import "./InternalHelperKipuBank.sol";
 
-/// @title KipuBankV4
-/// @notice Multi-token bank with ETH and ERC-20 support, USD-based limits, and admin recovery
+/// @title KipuBankV3
+/// @notice Advanced multi-token bank with Uniswap V3 integration for arbitrary token deposits
+/// @dev Supports ETH, USDC, and any ERC-20 token supported by Uniswap V3
 /// @author JPKP-Kuhn
-contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
+contract KipuBankV3 is AccessControl, InternalHelperKipuBank {
     using SafeERC20 for IERC20;
     
     // ============================================
@@ -49,11 +54,23 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
     /// @notice Array of supported tokens for enumeration
     address[] public supportedTokens;
 
-    /// @notice tonken => index of token in supportedToken, for O(1) search
+    /// @notice token => index of token in supportedToken, for O(1) search
     mapping(address => uint256) private tokenIndex;
 
     /// @notice Reentrancy lock
     bool private locked;
+
+    /// @notice UniversalRouter instance for Uniswap V4 integration
+    IUniversalRouter public immutable universalRouter;
+
+    /// @notice Permit2 instance for token approvals
+    IPermit2 public immutable permit2;
+
+    /// @notice USDC token address for swaps
+    address public immutable usdc;
+
+    /// @notice Uniswap V4 PoolManager for direct swaps
+    address public immutable poolManager;
 
     // ============================================
     // Modifiers
@@ -75,6 +92,8 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
     event WithdrawOk(address indexed user, uint256 value, uint256 newBalance, bytes feedback);
     event DepositTokenOk(address indexed user, address indexed token, uint256 value, uint256 newBalance, bytes feedback);
     event WithdrawTokenOk(address indexed user, address indexed token, uint256 value, uint256 newBalance, bytes feedback);
+    event DepositArbitraryTokenOk(address indexed user, address indexed token, uint256 inputAmount, uint256 usdcReceived, uint256 newBalance, bytes feedback);
+    event SwapExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
     event adminRecovery(address indexed user, uint256 oldBalance, uint256 newBalance, bytes feedback);
     event NativePerTxCapUpdated(uint256 oldCap, uint256 newCap);
 
@@ -84,7 +103,18 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
     
     /// @param _bankcap Bank capacity in ETH
     /// @param _oracle ETH/USD Chainlink oracle address
-    constructor(uint256 _bankcap, IChainLink _oracle) 
+    /// @param _universalRouter UniversalRouter contract address
+    /// @param _permit2 Permit2 contract address
+    /// @param _usdc USDC token address
+    /// @param _poolManager Uniswap V4 PoolManager address
+    constructor(
+        uint256 _bankcap, 
+        IChainLink _oracle,
+        IUniversalRouter _universalRouter,
+        IPermit2 _permit2,
+        address _usdc,
+        address _poolManager
+    ) 
         InternalHelperKipuBank(_oracle) 
     {
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -92,11 +122,22 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
         _grantRole(TOKEN_MANAGER_ROLE, msg.sender);
         
         bankCap = _bankcap * 1 ether;
+        universalRouter = _universalRouter;
+        permit2 = _permit2;
+        usdc = _usdc;
+        poolManager = _poolManager;
 
         // Add ETH as default supported token
         tokenOracles[ETH_ADDRESS] = _oracle;
         supportedTokens.push(ETH_ADDRESS);
         isSupportedToken[ETH_ADDRESS] = true;
+        tokenIndex[ETH_ADDRESS] = 1; // 1-based indexing
+
+        // Add USDC as supported token with oracle
+        tokenOracles[_usdc] = _oracle; // Using same oracle for USDC (should be USDC/USD oracle in production)
+        supportedTokens.push(_usdc);
+        isSupportedToken[_usdc] = true;
+        tokenIndex[_usdc] = 2; // 1-based indexing
     }
 
     // ============================================
@@ -274,6 +315,129 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
     }
 
     // ============================================
+    // Uniswap V4 Integration Functions
+    // ============================================
+
+    /// @notice Deposit any ERC-20 token and swap it to USDC
+    /// @param token Token address to deposit
+    /// @param amount Amount of tokens to deposit
+    /// @param minUsdcOut Minimum USDC amount expected from swap
+    /// @param deadline Deadline for the swap
+    function depositArbitraryToken(
+        address token,
+        uint256 amount,
+        uint256 minUsdcOut,
+        uint256 deadline
+    ) external noReentrancy {
+        if (amount == 0) revert ZeroAmount();
+        if (token == address(0) || token == ETH_ADDRESS) revert InvalidAddress();
+        if (token == usdc) revert InvalidAddress(); // Use depositToken for USDC directly
+        
+        // Check minimum deposit (converted to token units)
+        uint256 minDepositInToken = _convertEthToToken(minimumDeposit, token);
+        if (amount < minDepositInToken) revert MinimunDepositRequired();
+        
+        // Transfer tokens from user to contract
+        uint256 before = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - before;
+        
+        // Estimate USDC output (approximate, using oracle prices for validation)
+        // Note: This is an approximation for cap checking, actual amount may vary
+        uint256 estimatedEthEquivalent = _convertTokenToEth(received, token);
+        
+        // Check bank cap BEFORE swap (using estimated conversion)
+        if (totalBalance + estimatedEthEquivalent > bankCap) revert ExceedsBankCap();
+        
+        // Approve UniversalRouter to spend tokens
+        IERC20(token).forceApprove(address(universalRouter), received);
+        
+        // Execute swap to USDC
+        uint256 usdcReceived = _swapExactInputSingle(token, usdc, received, minUsdcOut, deadline);
+        
+        // Convert actual USDC received to ETH equivalent for bank cap check (final validation)
+        uint256 actualEthEquivalent = _convertTokenToEth(usdcReceived, usdc);
+        
+        // Final check: ensure swap didn't exceed cap (should not happen, but safety check)
+        if (totalBalance + actualEthEquivalent > bankCap) revert ExceedsBankCap();
+        
+        // Effects - update balances after successful swap
+        accountsBalance[msg.sender][usdc] += usdcReceived;
+        totalBalance += actualEthEquivalent;
+        _incrementDeposit();
+        
+        emit DepositArbitraryTokenOk(msg.sender, token, received, usdcReceived, accountsBalance[msg.sender][usdc], "Arbitrary Token Deposit Success!");
+    }
+
+    /// @notice Internal function to encode Uniswap V3 path
+    /// @param tokenIn Input token address
+    /// @param tokenOut Output token address
+    /// @param fee Fee tier (e.g., 3000 for 0.3%)
+    /// @return path Encoded path bytes
+    function _encodeV3Path(address tokenIn, address tokenOut, uint24 fee) internal pure returns (bytes memory path) {
+        // Uniswap V3 path format: token0 (20 bytes) + fee (3 bytes) + token1 (20 bytes) = 43 bytes
+        // Tokens must be sorted: token0 < token1 (for pool identification)
+        // But for the path, we keep the order as tokenIn -> tokenOut
+        path = new bytes(43);
+        assembly {
+            // Store tokenIn at position 0
+            mstore(add(path, 32), shl(96, tokenIn))
+            // Store fee at position 20 (3 bytes)
+            mstore(add(path, 52), shl(232, fee))
+            // Store tokenOut at position 23
+            mstore(add(path, 55), shl(96, tokenOut))
+        }
+    }
+
+    /// @notice Internal function to execute exact input single swap using UniversalRouter
+    /// @param tokenIn Input token address
+    /// @param tokenOut Output token address (should be USDC)
+    /// @param amountIn Amount of input tokens
+    /// @param minAmountOut Minimum amount of output tokens expected
+    /// @param deadline Deadline for the swap
+    /// @return amountOut Actual amount of output tokens received
+    function _swapExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 deadline
+    ) internal returns (uint256 amountOut) {
+        // Encode Uniswap V3 path: tokenIn -> fee -> tokenOut
+        bytes memory path = _encodeV3Path(tokenIn, tokenOut, uint24(3000)); // 0.3% fee tier
+        
+        // Prepare UniversalRouter commands and inputs
+        // V3_SWAP_EXACT_IN = 0x00
+        bytes memory commands = abi.encodePacked(uint8(0x00));
+        
+        // Encode swap parameters for V3_SWAP_EXACT_IN
+        // Parameters: (address recipient, uint256 amountIn, uint256 amountOutMin, bytes path, bool payerIsUser)
+        bytes memory swapParams = abi.encode(
+            address(this),    // recipient
+            amountIn,         // amountIn
+            minAmountOut,     // amountOutMinimum
+            path,             // path (token0 + fee + token1)
+            false             // payerIsUser (false because we're paying from contract balance)
+        );
+        
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = swapParams;
+        
+        // Record USDC balance before swap
+        uint256 usdcBefore = IERC20(tokenOut).balanceOf(address(this));
+        
+        // Execute swap via UniversalRouter
+        universalRouter.execute(commands, inputs, deadline);
+        
+        // Calculate actual amount received
+        amountOut = IERC20(tokenOut).balanceOf(address(this)) - usdcBefore;
+        
+        emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut);
+        
+        return amountOut;
+    }
+
+    // ============================================
     // Admin Functions
     // ============================================
 
@@ -367,6 +531,7 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
         tokenOracles[token] = tokenOracle;
         supportedTokens.push(token);
         isSupportedToken[token] = true;
+        tokenIndex[token] = supportedTokens.length; // 1-based indexing
         
         emit TokenAdded(token, address(tokenOracle), "Token Added Success!");
     }
@@ -380,8 +545,8 @@ contract KipuBankV4 is AccessControl, InternalHelperKipuBank {
         if (token == ETH_ADDRESS) revert InvalidAddress();
         if (!isSupportedToken[token]) revert TokenNotSupported();
         
-        uint indexToRemove = tokenIndex[token] -1;
-        uint lastIndex = supportedTokens.length -1;
+        uint indexToRemove = tokenIndex[token] - 1;
+        uint lastIndex = supportedTokens.length - 1;
 
         // If not the last element, move the last element to the removed position
         if (indexToRemove != lastIndex) {
